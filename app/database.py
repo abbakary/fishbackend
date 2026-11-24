@@ -11,13 +11,13 @@ class Base(DeclarativeBase):
     pass
 
 
-connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
-if settings.database_url.startswith("sqlite:///"):
-    db_path = settings.database_url.removeprefix("sqlite:///").split("?", 1)[0]
+connect_args = {"check_same_thread": False} if settings.validated_database_url.startswith("sqlite") else {}
+if settings.validated_database_url.startswith("sqlite:///"):
+    db_path = settings.validated_database_url.removeprefix("sqlite:///").split("?", 1)[0]
     if db_path != ":memory:":
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
-engine = create_engine(settings.database_url, connect_args=connect_args, pool_pre_ping=True)
+engine = create_engine(settings.validated_database_url, connect_args=connect_args, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
