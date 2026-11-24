@@ -17,6 +17,8 @@ COPY requirements.txt .
 
 # Install everything from requirements.txt (fastapi, uvicorn, psycopg2‑binary, etc.)
 RUN pip install --no-cache-dir -r requirements.txt
+# Ensure FastAPI and Uvicorn are installed (fallback if requirements missing)
+RUN pip install --no-cache-dir fastapi uvicorn[standard]
 
 # ---------- Copy source ----------
 # Now copy the rest of the application code
