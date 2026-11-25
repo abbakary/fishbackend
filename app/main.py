@@ -248,48 +248,7 @@ def health():
     return {"status": "ok", "service": "fishtrade-api"}
 
 
-@app.post("/api/v1/auth/register", status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterInput, db: Session = Depends(get_db)):
-    if db.query(User).filter(User.username == payload.username).first():
-        raise HTTPException(status_code=409, detail="Username already exists")
 
-    tenant_id = new_id()
-    tenant = Tenant(
-        id=tenant_id,
-        name=payload.company.strip(),
-        slug=f"{payload.company.strip().lower().replace(' ', '-')[:75]}-{tenant_id[:8]}",
-        plan=payload.plan,
-    )
-    branches = [
-        Branch(
-            id=new_id(), tenant_id=tenant_id,
-            name=b.name.strip(), region=b.region.strip(),
-            state=initial_state(b.state, b.region),
-        )
-        for b in payload.branches
-    ]
-    user = User(
-        id=new_id(),
-        tenant_id=tenant_id,
-        username=payload.username,
-        name=payload.name.strip(),
-        password_hash=hash_password(payload.password),
-        role="Owner",
-        phone=payload.phone.strip(),
-        branch_ids=[b.id for b in branches],
-    )
-    db.add_all([tenant, *branches, user])
-    db.add(AuditEvent(
-        id=new_id(), tenant_id=tenant_id, user_id=user.id,
-        action="tenant.registered", details={"branch_count": len(branches)},
-    ))
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="Could not create account") from exc
-    return {"access_token": create_access_token(user_id=user.id, tenant_id=tenant_id),
-            "token_type": "bearer", "user": user_payload(user), "tenant": tenant_payload(tenant, user)}
 
 
 @app.post("/api/v1/auth/login")
