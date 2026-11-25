@@ -75,7 +75,7 @@ def _ensure_user_profile_columns():
             ("permissions", "ALTER TABLE users ADD COLUMN permissions JSON NOT NULL DEFAULT '{}'"),
             ("module_keys", "ALTER TABLE users ADD COLUMN module_keys JSON NOT NULL DEFAULT '[]'"),
         )
-app.include_router(auth_router, prefix="/api/v1"):
+app.include_router(auth_router, prefix="/api/v1")
             if name not in existing:
                 conn.exec_driver_sql(ddl)
 
