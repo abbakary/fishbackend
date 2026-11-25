@@ -100,8 +100,8 @@ PLAN_USER_LIMITS = {"Starter": 5, "Business": 25, "Enterprise": 999}
 app = FastAPI(
     title="FishTrade Shared API",
     version="1.0.0",
-    docs_url="/docs" if (settings.app_env != "production" or settings.enable_docs) else None,
-    openapi_url="/openapi.json" if (settings.app_env != "production" or settings.enable_docs) else None,
+    docs_url="/docs" if settings.app_env != "production" else None,
+    docs_url="/docs",
     redoc_url=None,
 )
 
