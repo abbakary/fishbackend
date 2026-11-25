@@ -8,7 +8,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from .auth import Principal, current_principal, require_branch
-from .auth_router import router as auth_router
 from .config import settings
 from .database import Base, engine, get_db
 from .models import AuditEvent, Branch, Tenant, User
@@ -74,8 +73,7 @@ def _ensure_user_profile_columns():
             ("phone", "ALTER TABLE users ADD COLUMN phone VARCHAR(40) NOT NULL DEFAULT ''"),
             ("permissions", "ALTER TABLE users ADD COLUMN permissions JSON NOT NULL DEFAULT '{}'"),
             ("module_keys", "ALTER TABLE users ADD COLUMN module_keys JSON NOT NULL DEFAULT '[]'"),
-        )
-app.include_router(auth_router, prefix="/api/v1")
+        ):
             if name not in existing:
                 conn.exec_driver_sql(ddl)
 
@@ -115,7 +113,6 @@ if settings.app_env != "production":
         allow_methods=["*"],
         allow_headers=["*"],
     )
-app.include_router(auth_router, prefix="/api/v1")
 else:
     app.add_middleware(
         CORSMiddleware,
@@ -124,7 +121,6 @@ else:
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "If-Match", "Idempotency-Key"],
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 def tenant_payload(tenant: Tenant, user: User) -> dict:
@@ -222,7 +218,6 @@ def _supplier_outstanding(state: dict, supplier_id: str) -> float:
         for payment in _state_list(state, "pays")
         if payment.get("sup") == supplier_id
     )
-app.include_router(auth_router, prefix="/api/v1")
     return round(purchased - paid, 2)
 
 
@@ -246,7 +241,6 @@ def _commit_domain_command(*, branch: Branch, state: dict, expected_version: int
         branch=branch, state=state, expected_version=expected_version,
         principal=principal, db=db, action=f"domain.{action}", details=details,
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {**result, "version": version}
 
 
@@ -264,7 +258,85 @@ def _pick(obj, *names, default=""):
     return default
 
 
-# The registration endpoint has been moved to auth_router (backend/app/auth_router.py)
+def _as_dict(item) -> dict:
+    if isinstance(item, dict):
+        return item
+    return item.model_dump() if hasattr(item, "model_dump") else dict(vars(item))
+
+
+@app.post("/api/v1/auth/register", status_code=201)
+def register(payload: RegisterInput, db: Session = Depends(get_db)):
+    """Create tenant + branches + owner user + audit event in ONE transaction."""
+    username = str(_pick(payload, "username", "email")).strip().lower()
+    password = _pick(payload, "password")
+    company = str(_pick(payload, "company", "business_name", "tenant_name", "company_name")).strip()
+    owner_name = str(_pick(payload, "name", "full_name", "owner_name", default=username)).strip()
+    phone = str(_pick(payload, "phone", default="")).strip()
+    plan = str(_pick(payload, "plan", default="Starter")).strip()
+    if plan not in PLAN_BRANCH_LIMITS:
+        plan = "Starter"
+
+    branch_inputs = [_as_dict(b) for b in (getattr(payload, "branches", None) or [])]
+    if not branch_inputs:
+        branch_inputs = [{"name": "Main Branch", "region": "", "state": {}}]
+    if len(branch_inputs) > PLAN_BRANCH_LIMITS[plan]:
+        raise HTTPException(status_code=422, detail=f"The {plan} plan allows {PLAN_BRANCH_LIMITS[plan]} branch(es)")
+
+    if not username or not password or not company:
+        raise HTTPException(status_code=422, detail="Username, password and company are required")
+    if db.query(User).filter(User.username == username).first():
+        raise HTTPException(status_code=409, detail="Username already exists")
+
+    base_slug = re.sub(r"[^a-z0-9]+", "-", company.lower()).strip("-") or "tenant"
+    slug, n = base_slug, 1
+    while db.query(Tenant).filter(Tenant.slug == slug).first():
+        n += 1
+        slug = f"{base_slug}-{n}"
+
+    try:
+        tenant = Tenant(id=new_id(), name=company, slug=slug, plan=plan, status="active")
+        db.add(tenant)
+        db.flush()  # tenant row must exist before anything references it
+
+        branch_ids = []
+        for b in branch_inputs:
+            region = str(b.get("region") or "").strip()
+            branch = Branch(
+                id=new_id(), tenant_id=tenant.id,
+                name=str(b.get("name") or "Main Branch").strip(), region=region,
+                state=initial_state(b.get("state") or None, region),
+            )
+            db.add(branch)
+            branch_ids.append(branch.id)
+        db.flush()
+
+        user = User(
+            id=new_id(), tenant_id=tenant.id, username=username, name=owner_name,
+            password_hash=hash_password(password), role="Owner", phone=phone,
+            permissions={}, module_keys=[], branch_ids=branch_ids, active=True,
+        )
+        db.add(user)
+        db.flush()
+
+        db.add(AuditEvent(
+            id=new_id(), tenant_id=tenant.id, user_id=user.id,
+            action="tenant.registered", details={"branch_count": len(branch_ids)},
+        ))
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        if getattr(exc.orig, "pgcode", None) == "23505":  # real duplicate (username/slug)
+            raise HTTPException(status_code=409, detail="Account already exists") from exc
+        raise  # FK/other errors are server bugs: log as 500, not a fake 409
+
+    db.refresh(tenant)
+    return {
+        "access_token": create_access_token(user_id=user.id, tenant_id=tenant.id),
+        "token_type": "bearer",
+        "user": user_payload(user),
+        "tenant": tenant_payload(tenant, user),
+    }
+
 
 @app.post("/api/v1/auth/login")
 def login(payload: LoginInput, db: Session = Depends(get_db)):
@@ -274,7 +346,6 @@ def login(payload: LoginInput, db: Session = Depends(get_db)):
         .filter(User.username == payload.username.strip().lower())
         .first()
     )
-app.include_router(auth_router, prefix="/api/v1")
     if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Incorrect username or password")
     if not user.active or user.tenant.status == "suspended":
@@ -330,15 +401,13 @@ def create_branch(
         name=payload.name.strip(), region=payload.region.strip(),
         state=initial_state(payload.state, payload.region),
     )
-app.include_router(auth_router, prefix="/api/v1")
     db.add(branch)
     db.flush()  # branch row must exist before the audit event references it
     db.add(AuditEvent(
         id=new_id(), tenant_id=principal.tenant.id, branch_id=branch.id,
         user_id=principal.user.id, action="branch.created",
         details={"name": branch.name, "region": branch.region},
-    )
-app.include_router(auth_router, prefix="/api/v1"))
+    ))
     db.commit()
     return {"id": branch.id, "name": branch.name, "region": branch.region,
             "version": branch.version, "state": branch.state}
@@ -375,14 +444,12 @@ def create_staff(
         permissions=payload.permissions, module_keys=payload.module_keys,
         branch_ids=payload.branch_ids, active=True,
     )
-app.include_router(auth_router, prefix="/api/v1")
     db.add(user)
     db.flush()  # user row first, in case audit_events.user_id is a foreign key
     db.add(AuditEvent(
         id=new_id(), tenant_id=principal.tenant.id, user_id=principal.user.id,
         action="staff.created", details={"staff_id": user.id, "role": user.role},
-    )
-app.include_router(auth_router, prefix="/api/v1"))
+    ))
     db.commit()
     return user_payload(user)
 
@@ -450,8 +517,7 @@ def update_staff(
     db.add(AuditEvent(
         id=new_id(), tenant_id=principal.tenant.id, user_id=principal.user.id,
         action="staff.updated", details={"staff_id": user.id, **changes},
-    )
-app.include_router(auth_router, prefix="/api/v1"))
+    ))
     db.commit()
     return user_payload(user)
 
@@ -484,15 +550,13 @@ def initialize_branch_state(
         .where(Branch.id == branch.id, Branch.tenant_id == principal.tenant.id)
         .values(state=state, version=Branch.version + 1, updated_at=datetime.now(timezone.utc))
     )
-app.include_router(auth_router, prefix="/api/v1")
     if updated.rowcount != 1:
         db.rollback()
         raise HTTPException(status_code=409, detail="Could not initialize branch")
     db.add(AuditEvent(
         id=new_id(), tenant_id=principal.tenant.id, branch_id=branch.id,
         user_id=principal.user.id, action="branch.initialized", details={},
-    )
-app.include_router(auth_router, prefix="/api/v1"))
+    ))
     db.commit()
     db.refresh(branch)
     return {"branch_id": branch.id, "version": branch.version, "initialized": True}
@@ -513,11 +577,9 @@ def put_branch_state(
             Branch.tenant_id == principal.tenant.id,
             Branch.version == payload.expected_version,
         )
-app.include_router(auth_router, prefix="/api/v1")
         .values(state=payload.state, version=Branch.version + 1,
                 updated_at=datetime.now(timezone.utc))
     )
-app.include_router(auth_router, prefix="/api/v1")
     if updated.rowcount != 1:
         db.rollback()
         raise HTTPException(
@@ -525,13 +587,11 @@ app.include_router(auth_router, prefix="/api/v1")
             detail={"code": "version_conflict", "message": "Branch data changed elsewhere. Reload before saving.",
                     "current_version": branch.version},
         )
-app.include_router(auth_router, prefix="/api/v1")
     db.add(AuditEvent(
         id=new_id(), tenant_id=principal.tenant.id, branch_id=branch_id,
         user_id=principal.user.id, action="branch.state_updated",
         details={"from_version": payload.expected_version, "to_version": payload.expected_version + 1},
-    )
-app.include_router(auth_router, prefix="/api/v1"))
+    ))
     db.commit()
     return {"branch_id": branch_id, "version": payload.expected_version + 1}
 
@@ -553,27 +613,22 @@ def _write_branch_state(
             Branch.tenant_id == principal.tenant.id,
             Branch.version == expected_version,
         )
-app.include_router(auth_router, prefix="/api/v1")
         .values(
             state=state,
             version=Branch.version + 1,
             updated_at=datetime.now(timezone.utc),
         )
-app.include_router(auth_router, prefix="/api/v1")
     )
-app.include_router(auth_router, prefix="/api/v1")
     if result.rowcount != 1:
         db.rollback()
         raise HTTPException(
             status_code=409,
             detail={"code": "version_conflict", "message": "Branch data changed elsewhere. Reload before saving."},
         )
-app.include_router(auth_router, prefix="/api/v1")
     db.add(AuditEvent(
         id=new_id(), tenant_id=principal.tenant.id, branch_id=branch.id,
         user_id=principal.user.id, action=action, details=details,
-    )
-app.include_router(auth_router, prefix="/api/v1"))
+    ))
     db.commit()
     return expected_version + 1
 
@@ -619,7 +674,6 @@ def create_branch_collection_item(
         principal=principal, db=db, action="branch.collection_item_created",
         details={"collection": key, "item_id": new_item["id"]},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"item": new_item, "version": version}
 
 
@@ -651,7 +705,6 @@ def update_branch_collection_item(
         principal=principal, db=db, action="branch.collection_item_updated",
         details={"collection": key, "item_id": item_id},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"item": updated_item, "version": version}
 
 
@@ -678,7 +731,6 @@ def delete_branch_collection_item(
         principal=principal, db=db, action="branch.collection_item_deleted",
         details={"collection": key, "item_id": item_id},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"deleted": True, "version": version}
 
 
@@ -697,13 +749,11 @@ def list_branch_audit(
             AuditEvent.tenant_id == principal.tenant.id,
             AuditEvent.branch_id == branch.id,
         )
-app.include_router(auth_router, prefix="/api/v1")
         .order_by(AuditEvent.created_at.desc())
         .offset(offset)
         .limit(limit)
         .all()
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"items": [{
         "id": event.id,
         "user_id": event.user_id,
@@ -800,7 +850,6 @@ def command_purchase(
             reference=pur_no, notes="Fuel debt recovered from catch payout",
             user_name=principal.user.name,
         )
-app.include_router(auth_router, prefix="/api/v1")
     if payload.maint_deducted > 0:
         _ledger_entry(
             state, supplier_id=payload.supplier_id,
@@ -809,7 +858,6 @@ app.include_router(auth_router, prefix="/api/v1")
             reference=pur_no, notes="Maintenance debt recovered from catch payout",
             user_name=principal.user.name,
         )
-app.include_router(auth_router, prefix="/api/v1")
     if deductions > 0:
         _state_list(state, "settlements").insert(0, {
             "id": new_id(), "no": _next_number(state, "set", "SET-", 6),
@@ -838,7 +886,6 @@ app.include_router(auth_router, prefix="/api/v1")
             "supplier_balance": _supplier_outstanding(state, payload.supplier_id),
         },
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 @app.post("/api/v1/branches/{branch_id}/commands/batches/{batch_id}/inspect")
@@ -870,7 +917,6 @@ def command_inspect_batch(
         details={"batch_id": batch_id, "accepted_kg": payload.accepted_kg},
         result={"batch": batch},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 @app.post("/api/v1/branches/{branch_id}/commands/supplier-payments")
@@ -904,7 +950,6 @@ def command_supplier_payment(
             "supplier_balance": round(outstanding - payload.amount, 2),
         },
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 @app.post("/api/v1/branches/{branch_id}/commands/sales")
@@ -952,7 +997,6 @@ def command_sale(
         principal=principal, db=db, action="sale_recorded",
         details={"sale": no, "kg": payload.kg}, result={"sale": sale},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 @app.post("/api/v1/branches/{branch_id}/commands/fuel-issues")
@@ -1005,7 +1049,6 @@ def command_fuel_issue(
         principal=principal, db=db, action="fuel_issued",
         details={"issue": no, "litres": payload.litres}, result={"issue": issue},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 @app.post("/api/v1/branches/{branch_id}/commands/gear-issues")
@@ -1062,7 +1105,6 @@ def command_gear_issue(
         principal=principal, db=db, action="gear_issued",
         details={"issue": no, "items": len(lines)}, result={"issue": issue},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1092,7 +1134,6 @@ def command_fuel_receive(
             status_code=422,
             detail=f"Delivery of {payload.litres} L would overflow tank capacity {capacity} L",
         )
-app.include_router(auth_router, prefix="/api/v1")
     tank["current"] = current + payload.litres
     no = f"FP-{new_id()[:8].upper()}"
     now = datetime.now(timezone.utc)
@@ -1112,7 +1153,6 @@ app.include_router(auth_router, prefix="/api/v1")
         details={"no": no, "litres": payload.litres, "tank": payload.tank_id},
         result={"purchase": purchase, "tank_current": tank["current"]},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 # ── Fuel: record debt repayment from fisherman ───────────────────────────────
@@ -1144,14 +1184,12 @@ def command_fuel_debt_payment(
         source="fuel", reference=ref, notes=f"Fuel debt repaid ({payload.method})",
         user_name=principal.user.name,
     )
-app.include_router(auth_router, prefix="/api/v1")
     return _commit_domain_command(
         branch=branch, state=state, expected_version=expected_version,
         principal=principal, db=db, action="fuel_debt_repaid",
         details={"supplier": payload.supplier_id, "amount": payload.amount},
         result={"payment": payment},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 # ── Fuel: dipstick / tank adjustment ─────────────────────────────────────────
@@ -1185,7 +1223,6 @@ def command_fuel_adjustment(
         principal=principal, db=db, action="fuel_adjustment_recorded",
         details={"tank": payload.tank_id, "new_level": payload.new_level_litres},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"adjustment": adj, "version": version}
 
 
@@ -1243,7 +1280,6 @@ def command_create_work_order(
             source="maintenance", reference=no, notes=payload.title,
             user_name=principal.user.name,
         )
-app.include_router(auth_router, prefix="/api/v1")
     _state_list(state, "boatCostLedger").insert(0, {
         "id": new_id(), "boatId": payload.boat_id,
         "seasonId": state.get("activeSeasonId", ""),
@@ -1257,7 +1293,6 @@ app.include_router(auth_router, prefix="/api/v1")
         details={"work_order": no, "boat": payload.boat_id},
         result={"work_order": wo},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 # ── Maintenance: update work order status ────────────────────────────────────
@@ -1287,7 +1322,6 @@ def command_update_work_order_status(
         principal=principal, db=db, action="work_order_status_updated",
         details={"work_order": wo_id, "status": payload.status},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"work_order": wo, "version": version}
 
 
@@ -1318,14 +1352,12 @@ def command_maint_debt_payment(
         source="maintenance", reference=ref, notes=payload.notes,
         user_name=principal.user.name,
     )
-app.include_router(auth_router, prefix="/api/v1")
     return _commit_domain_command(
         branch=branch, state=state, expected_version=expected_version,
         principal=principal, db=db, action="maint_debt_repaid",
         details={"supplier": payload.supplier_id, "amount": payload.amount},
         result={"payment": payment},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 # ── Gear: return/inspect gear ─────────────────────────────────────────────────
@@ -1366,13 +1398,11 @@ def command_gear_return(
             notes="Equipment returned – debt cleared",
             user_name=principal.user.name,
         )
-app.include_router(auth_router, prefix="/api/v1")
     version = _write_branch_state(
         branch=branch, state=state, expected_version=payload.expected_version,
         principal=principal, db=db, action="gear_returned",
         details={"issue": issue_id, "condition": payload.returned_condition},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"issue": issue, "version": version}
 
 
@@ -1397,7 +1427,6 @@ def command_transfer_batch(
         principal=principal, db=db, action="batch_transferred",
         details={"batch": batch_id, "from": old_wh, "to": payload.warehouse},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"batch": batch, "version": version}
 
 
@@ -1425,7 +1454,6 @@ def command_batch_waste(
         principal=principal, db=db, action="batch_waste_recorded",
         details={"batch": batch_id, "waste_kg": payload.waste_kg},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"batch": batch, "version": version}
 
 
@@ -1450,7 +1478,6 @@ def command_dispatch_sale(
         principal=principal, db=db, action="sale_dispatched",
         details={"sale": sale_id, "status": payload.status},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"sale": sale, "version": version}
 
 
@@ -1478,7 +1505,6 @@ def command_receive_sale_payment(
         principal=principal, db=db, action="customer_payment_received",
         details={"sale": sale_id, "amount": payload.amount},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"sale": sale, "version": version}
 
 
@@ -1511,7 +1537,6 @@ def command_catering_advance(
         details={"no": no, "cook": payload.cook_id},
         result={"advance": advance},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 # ── Catering: record meal expense and boat allocations ───────────────────────
@@ -1561,7 +1586,6 @@ def command_catering_expense(
                 notes=f"{payload.meal_type} via cook",
                 user_name=principal.user.name,
             )
-app.include_router(auth_router, prefix="/api/v1")
             _state_list(state, "boatCostLedger").insert(0, {
                 "id": new_id(), "boatId": alloc.boat_id,
                 "seasonId": state.get("activeSeasonId", ""),
@@ -1575,7 +1599,6 @@ app.include_router(auth_router, prefix="/api/v1")
         details={"no": no, "total": payload.total_spent},
         result={"expense": expense},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 # ── Cash Advances: request ────────────────────────────────────────────────────
@@ -1610,7 +1633,6 @@ def command_advance_request(
         details={"no": no, "amount": payload.amount, "category": payload.category},
         result={"advance": advance},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 # ── Cash Advances: approve or reject ─────────────────────────────────────────
@@ -1643,13 +1665,11 @@ def command_advance_approve(
             notes=f"{advance.get('category', '')}: {advance.get('purpose', '')}",
             user_name=principal.user.name,
         )
-app.include_router(auth_router, prefix="/api/v1")
     version = _write_branch_state(
         branch=branch, state=state, expected_version=payload.expected_version,
         principal=principal, db=db, action=f"advance_{payload.new_status.lower()}",
         details={"advance": advance_id, "amount": final_amount},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"advance": advance, "version": version}
 
 
@@ -1675,13 +1695,11 @@ def command_advance_repay(
         notes=f"Direct repayment ({payload.method}) for {advance.get('no', '')}",
         user_name=principal.user.name,
     )
-app.include_router(auth_router, prefix="/api/v1")
     version = _write_branch_state(
         branch=branch, state=state, expected_version=payload.expected_version,
         principal=principal, db=db, action="advance_repaid",
         details={"advance": advance_id, "amount": payload.amount},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"advance": advance, "version": version}
 
 
@@ -1727,7 +1745,6 @@ def command_create_boat_project(
         details={"no": no, "total_cost": total},
         result={"project": project},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 @app.patch("/api/v1/branches/{branch_id}/commands/boat-projects/{project_id}/progress")
@@ -1762,7 +1779,6 @@ def command_update_project_progress(
         principal=principal, db=db, action="project_progress_updated",
         details={"project": project_id, "progress_pct": payload.progress_pct, "status": payload.status},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"project": project, "version": version}
 
 
@@ -1789,7 +1805,6 @@ def command_project_stage_payment(
         principal=principal, db=db, action="project_stage_paid",
         details={"project": project_id, "stage": payload.stage_name, "amount": payload.amount},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"project": project, "version": version}
 
 
@@ -1828,7 +1843,6 @@ def command_assign_crew(
         details={"boat": payload.boat_id, "fisherman": payload.fisherman_name},
         result={"assignment": assignment},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 # ── Kibalua (temporary) engagement ───────────────────────────────────────────
@@ -1881,7 +1895,6 @@ def command_create_kibalua(
         details={"no": no, "fisherman": payload.fisherman_name},
         result={"engagement": engagement},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 @app.patch("/api/v1/branches/{branch_id}/commands/kibalua-engagements/{eng_id}/settle")
@@ -1903,7 +1916,6 @@ def command_settle_kibalua(
         principal=principal, db=db, action="kibalua_settled",
         details={"engagement": eng_id, "final_payment": payload.final_payment},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"engagement": eng, "version": version}
 
 
@@ -1949,7 +1961,6 @@ def command_fisherman_exit(
         principal=principal, db=db, action="fisherman_exited",
         details={"assignment": payload.assignment_id, "reason": payload.reason},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"exit_record": exit_record, "version": version}
 
 
@@ -1983,7 +1994,6 @@ def command_boat_expense_allocation(
                 source="other", reference=payload.boat_id,
                 notes=payload.description, user_name=principal.user.name,
             )
-app.include_router(auth_router, prefix="/api/v1")
     now = datetime.now(timezone.utc)
     allocation = {
         "id": new_id(), "boatId": payload.boat_id, "boatReg": payload.boat_reg,
@@ -2007,7 +2017,6 @@ app.include_router(auth_router, prefix="/api/v1")
         details={"boat": payload.boat_id, "type": payload.expense_type, "total": payload.total_amount},
         result={"allocation": allocation},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 # ── Full Season Settlement ────────────────────────────────────────────────────
@@ -2028,7 +2037,6 @@ def command_full_settlement(
         payload.fuel_deducted + payload.maint_deducted + payload.gear_deducted
         + payload.food_deducted + payload.advances_deducted + payload.other_deducted
     )
-app.include_router(auth_router, prefix="/api/v1")
     net_payable = max(0.0, payload.agreed_earnings - payload.previous_paid - total_deductions)
     no = f"SET-{new_id()[:8].upper()}"
     now = datetime.now(timezone.utc)
@@ -2055,7 +2063,6 @@ app.include_router(auth_router, prefix="/api/v1")
             notes="Season settlement deductions cleared",
             user_name=principal.user.name,
         )
-app.include_router(auth_router, prefix="/api/v1")
     # Create supplier payment for net payable
     if net_payable > 0:
         _state_list(state, "pays").insert(0, {
@@ -2069,7 +2076,6 @@ app.include_router(auth_router, prefix="/api/v1")
         details={"no": no, "net_payable": net_payable},
         result={"settlement": settlement},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 # ── Operating Expenses ────────────────────────────────────────────────────────
@@ -2095,7 +2101,6 @@ def command_add_expense(
         details={"category": payload.category, "amount": payload.amount},
         result={"expense": expense},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 # ── Transport trips ───────────────────────────────────────────────────────────
@@ -2125,7 +2130,6 @@ def command_add_trip(
         details={"mode": payload.mode, "cost": payload.cost},
         result={"trip": trip},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 # ── Compliance permits ────────────────────────────────────────────────────────
@@ -2150,7 +2154,6 @@ def command_add_permit(
         details={"type": payload.permit_type, "ref": payload.reference},
         result={"permit": permit},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 # ── Season management ─────────────────────────────────────────────────────────
@@ -2178,7 +2181,6 @@ def command_add_season(
         details={"code": payload.code},
         result={"season": season},
     )
-app.include_router(auth_router, prefix="/api/v1")
 
 
 @app.post("/api/v1/branches/{branch_id}/commands/set-active-season")
@@ -2199,5 +2201,4 @@ def command_set_active_season(
         principal=principal, db=db, action="active_season_changed",
         details={"from": old_id, "to": payload.season_id},
     )
-app.include_router(auth_router, prefix="/api/v1")
     return {"activeSeasonId": payload.season_id, "version": version}
