@@ -3,7 +3,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     app_env: str = "development"
-    database_url: str = ""  # will be provided via env var DATABASE_URL (Railway) or .env for local dev
+# The DATABASE_URL will be supplied by Railway (or set locally via .env)
+    # Use the placeholder syntax so Railway can replace it automatically.
+    # Example entry in .env:
+    # DATABASE_URL=${{ Postgres.DATABASE_PRIVATE_URL }}
+    database_url: str = "${{ Postgres.DATABASE_PRIVATE_URL }}"  # will be overridden by env var
+
 
     @property
     def validated_database_url(self) -> str:
