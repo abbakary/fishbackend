@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     # and name it DATABASE_URL. Do NOT put a ${{ ... }} placeholder in code.
     database_url: str = Field(default="", validation_alias=AliasChoices(*_URL_VARS))
 
+    # Set ENABLE_DOCS=true in Railway to expose /docs while in production (turn off when done testing)
+    enable_docs: bool = False
+
     jwt_secret: str = "development-only-change-me"
     jwt_expire_minutes: int = 720
     cors_origins: str = "http://localhost:3000,http://localhost:5173"
