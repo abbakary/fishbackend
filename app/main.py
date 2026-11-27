@@ -1820,14 +1820,40 @@ def command_assign_crew(
 ):
     branch = require_branch(principal, branch_id)
     state = dict(branch.state or {})
-    if not any(b.get("id") == payload.boat_id for b in _state_list(state, "boats")):
+    boat = next((b for b in _state_list(state, "boats") if b.get("id") == payload.boat_id), None)
+    if boat is None:
         raise HTTPException(status_code=404, detail="Boat not found")
-    if not any(s.get("id") == payload.supplier_id for s in _state_list(state, "suppliers")):
-        raise HTTPException(status_code=404, detail="Supplier / fisherman not found")
+
+    suppliers = _state_list(state, "suppliers")
+    sup_id = (payload.supplier_id or "").strip()
+    supplier = next((s for s in suppliers if s.get("id") == sup_id), None) if sup_id else None
+    if supplier is None:
+        sup_id = sup_id or new_id()
+        supplier = {
+            "id": sup_id,
+            "no": f"SUP-{sup_id[:6]}",
+            "name": payload.fisherman_name,
+            "phone": payload.phone,
+            "site": boat.get("landingSite", ""),
+            "cat": "Individual Fisherman",
+            "source_type": "internal",
+            "sourceType": "internal",
+            "boat": payload.boat_name or boat.get("name", ""),
+            "boatId": boat.get("id", ""),
+            "boatReg": payload.boat_reg or boat.get("regNo", ""),
+            "nida": payload.nida,
+            "creditLimit": 2000000,
+            "status": "Active",
+            "totalSupplied": 0,
+        }
+        suppliers.append(supplier)
+
     now = datetime.now(timezone.utc)
     assignment = {
-        "id": new_id(), "boatId": payload.boat_id, "boatReg": payload.boat_reg,
-        "boatName": payload.boat_name, "supId": payload.supplier_id,
+        "id": new_id(), "boatId": payload.boat_id,
+        "boatReg": payload.boat_reg or boat.get("regNo", ""),
+        "boatName": payload.boat_name or boat.get("name", ""),
+        "supId": sup_id,
         "fishermanName": payload.fisherman_name, "position": payload.position,
         "accountType": payload.account_type, "phone": payload.phone,
         "nida": payload.nida, "seasonId": state.get("activeSeasonId", ""),
@@ -1842,7 +1868,7 @@ def command_assign_crew(
         branch=branch, state=state, expected_version=expected_version,
         principal=principal, db=db, action="crew_assigned",
         details={"boat": payload.boat_id, "fisherman": payload.fisherman_name},
-        result={"assignment": assignment},
+        result={"assignment": assignment, "supplier": supplier},
     )
 
 
@@ -2119,7 +2145,9 @@ def command_add_trip(
     trip = {
         "id": new_id(), "type": payload.trip_type, "mode": payload.mode,
         "from": payload.from_location, "to": payload.to_location,
-        "cost": payload.cost, "date": now.date().isoformat(),
+        "cost": payload.cost, "kg": payload.kg,
+        "pricePerKg": payload.price_per_kg, "species": payload.species,
+        "date": now.date().isoformat(),
         "ref": payload.sale_ref, "veh": payload.vehicle,
         "temp": payload.temperature, "method": payload.method,
         "notes": payload.notes,
